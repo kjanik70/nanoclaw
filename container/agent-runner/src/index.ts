@@ -418,6 +418,7 @@ async function runQuery(
     prompt: stream,
     options: {
       cwd: '/workspace/group',
+      model: sdkEnv.CLAUDE_MODEL || undefined,
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
@@ -513,6 +514,21 @@ async function main(): Promise<void> {
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
   for (const [key, value] of Object.entries(containerInput.secrets || {})) {
     sdkEnv[key] = value;
+  }
+  // Merge API config (model, base URL, auth token) into the user-level settings.json
+  // so Claude Code picks it up.  The SDK query option `model` alone may not propagate.
+  const userSettingsDir = path.join(process.env.HOME || '/home/node', '.claude');
+  const userSettingsPath = path.join(userSettingsDir, 'settings.json');
+  if (sdkEnv.CLAUDE_MODEL || sdkEnv.ANTHROPIC_BASE_URL || sdkEnv.ANTHROPIC_AUTH_TOKEN) {
+    let settings: Record<string, unknown> = {};
+    try { settings = JSON.parse(fs.readFileSync(userSettingsPath, 'utf-8')); } catch { /* file may not exist */ }
+    if (sdkEnv.CLAUDE_MODEL) settings.model = sdkEnv.CLAUDE_MODEL;
+    const envBlock = (settings.env as Record<string, string>) || {};
+    if (sdkEnv.ANTHROPIC_BASE_URL) envBlock.ANTHROPIC_BASE_URL = sdkEnv.ANTHROPIC_BASE_URL;
+    if (sdkEnv.ANTHROPIC_AUTH_TOKEN) envBlock.ANTHROPIC_AUTH_TOKEN = sdkEnv.ANTHROPIC_AUTH_TOKEN;
+    settings.env = envBlock;
+    fs.mkdirSync(userSettingsDir, { recursive: true });
+    fs.writeFileSync(userSettingsPath, JSON.stringify(settings, null, 2));
   }
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
