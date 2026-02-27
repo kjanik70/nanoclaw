@@ -182,6 +182,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
+  // Heartbeat: send a periodic "still working" message when the agent
+  // has been running for a while without producing visible output.
+  const HEARTBEAT_INTERVAL = 60_000;
+  let heartbeatDone = false;
+  let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const resetHeartbeat = () => {
+    if (heartbeatTimer) clearTimeout(heartbeatTimer);
+    if (heartbeatDone) return;
+    heartbeatTimer = setTimeout(async () => {
+      if (heartbeatDone) return;
+      await channel.sendMessage(chatJid, '_Still working on this..._').catch(() => {});
+      resetHeartbeat();
+    }, HEARTBEAT_INTERVAL);
+  };
+
+  resetHeartbeat();
+
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.result) {
@@ -195,6 +213,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
+      resetHeartbeat();
     }
 
     if (result.status === 'success') {
@@ -208,6 +227,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
+  heartbeatDone = true;
+  if (heartbeatTimer) clearTimeout(heartbeatTimer);
 
   if (output === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —
