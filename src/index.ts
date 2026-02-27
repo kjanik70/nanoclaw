@@ -213,11 +213,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
+      // Restart heartbeat (agent may be working on a piped follow-up message)
+      heartbeatDone = false;
       resetHeartbeat();
     }
 
     if (result.status === 'success') {
       queue.notifyIdle(chatJid);
+      // Agent finished its turn — stop heartbeat until new output arrives
+      heartbeatDone = true;
+      if (heartbeatTimer) clearTimeout(heartbeatTimer);
     }
 
     if (result.status === 'error') {
