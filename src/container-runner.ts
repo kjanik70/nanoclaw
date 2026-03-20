@@ -76,6 +76,18 @@ function buildVolumeMounts(
       containerPath: '/workspace/group',
       readonly: false,
     });
+    // Google Calendar credentials (main only)
+    const gcalDir = path.join(
+      process.env.HOME || '/root',
+      '.config', 'nanoclaw', 'google-calendar',
+    );
+    if (fs.existsSync(gcalDir)) {
+      mounts.push({
+        hostPath: gcalDir,
+        containerPath: '/workspace/google-calendar',
+        readonly: false,  // tokens need refresh
+      });
+    }
   } else {
     // Other groups only get their own folder
     mounts.push({

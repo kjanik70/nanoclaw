@@ -214,6 +214,24 @@ You can read and write to `/workspace/project/groups/global/CLAUDE.md` for facts
 
 ---
 
+## Google Calendar
+
+You have access to Google Calendar via MCP tools (prefixed `mcp__google-calendar__`):
+
+- `list-calendars` — List all calendars
+- `list-events` — List events with date filtering
+- `get-event` — Get event details by ID
+- `search-events` — Search events by text
+- `create-event` — Create new events
+- `update-event` — Update existing events
+- `delete-event` — Delete events
+- `respond-to-event` — Accept/decline invitations
+- `get-freebusy` — Check availability
+- `get-current-time` — Get current time in calendar timezone
+- `list-colors` — List available event colors
+
+---
+
 ## Scheduling for Other Groups
 
 When scheduling tasks for other groups, use the `target_group_jid` parameter with the group's JID from `registered_groups.json`:
