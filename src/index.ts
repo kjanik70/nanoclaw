@@ -6,8 +6,11 @@ import {
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
+  TELEGRAM_BOT_TOKEN,
+  TELEGRAM_ONLY,
   TRIGGER_PATTERN,
 } from './config.js';
+import { TelegramChannel } from './channels/telegram.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import {
   ContainerOutput,
@@ -34,7 +37,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { broadcastToSiblings, findChannel, formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -182,24 +185,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
-  // Heartbeat: send a periodic "still working" message when the agent
-  // has been running for a while without producing visible output.
-  const HEARTBEAT_INTERVAL = 60_000;
-  let heartbeatDone = false;
-  let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
-
-  const resetHeartbeat = () => {
-    if (heartbeatTimer) clearTimeout(heartbeatTimer);
-    if (heartbeatDone) return;
-    heartbeatTimer = setTimeout(async () => {
-      if (heartbeatDone) return;
-      await channel.sendMessage(chatJid, '_Still working on this..._').catch(() => {});
-      resetHeartbeat();
-    }, HEARTBEAT_INTERVAL);
-  };
-
-  resetHeartbeat();
-
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.result) {
@@ -209,20 +194,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
         await channel.sendMessage(chatJid, text);
+        broadcastToSiblings(channels, chatJid, group.folder, text, registeredGroups);
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
-      // Restart heartbeat (agent may be working on a piped follow-up message)
-      heartbeatDone = false;
-      resetHeartbeat();
     }
 
     if (result.status === 'success') {
       queue.notifyIdle(chatJid);
-      // Agent finished its turn — stop heartbeat until new output arrives
-      heartbeatDone = true;
-      if (heartbeatTimer) clearTimeout(heartbeatTimer);
     }
 
     if (result.status === 'error') {
@@ -232,8 +212,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
-  heartbeatDone = true;
-  if (heartbeatTimer) clearTimeout(heartbeatTimer);
 
   if (output === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —
@@ -471,9 +449,17 @@ async function main(): Promise<void> {
   };
 
   // Create and connect channels
-  whatsapp = new WhatsAppChannel(channelOpts);
-  channels.push(whatsapp);
-  await whatsapp.connect();
+  if (TELEGRAM_BOT_TOKEN) {
+    const telegram = new TelegramChannel(TELEGRAM_BOT_TOKEN, channelOpts);
+    channels.push(telegram);
+    await telegram.connect();
+  }
+
+  if (!TELEGRAM_ONLY) {
+    whatsapp = new WhatsAppChannel(channelOpts);
+    channels.push(whatsapp);
+    await whatsapp.connect();
+  }
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
@@ -488,14 +474,20 @@ async function main(): Promise<void> {
         return;
       }
       const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
+      if (text) {
+        await channel.sendMessage(jid, text);
+        const group = registeredGroups[jid];
+        if (group) broadcastToSiblings(channels, jid, group.folder, text, registeredGroups);
+      }
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
+    sendMessage: async (jid, text) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
+      await channel.sendMessage(jid, text);
+      const group = registeredGroups[jid];
+      if (group) broadcastToSiblings(channels, jid, group.folder, text, registeredGroups);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

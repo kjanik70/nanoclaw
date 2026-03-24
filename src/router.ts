@@ -1,4 +1,5 @@
-import { Channel, NewMessage } from './types.js';
+import { logger } from './logger.js';
+import { Channel, NewMessage, RegisteredGroup } from './types.js';
 
 export function escapeXml(s: string): string {
   if (!s) return '';
@@ -41,4 +42,22 @@ export function findChannel(
   jid: string,
 ): Channel | undefined {
   return channels.find((c) => c.ownsJid(jid));
+}
+
+export function broadcastToSiblings(
+  channels: Channel[],
+  originJid: string,
+  folder: string,
+  text: string,
+  registeredGroups: Record<string, RegisteredGroup>,
+): void {
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (jid === originJid || group.folder !== folder) continue;
+    const channel = channels.find(c => c.ownsJid(jid) && c.isConnected());
+    if (channel) {
+      channel.sendMessage(jid, text).catch(err =>
+        logger.warn({ jid, err }, 'Failed to cross-post to sibling channel'),
+      );
+    }
+  }
 }
