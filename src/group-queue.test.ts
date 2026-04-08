@@ -421,4 +421,228 @@ describe('GroupQueue', () => {
     resolveProcess!();
     await vi.advanceTimersByTimeAsync(10);
   });
+
+  // --- Folder-aware sibling coordination ---
+
+  describe('folder-aware sibling coordination', () => {
+    it('preempts sibling task container when interactive message arrives', async () => {
+      const fs = await import('fs');
+      let resolveTask: () => void;
+
+      const taskFn = vi.fn(async () => {
+        await new Promise<void>((resolve) => {
+          resolveTask = resolve;
+        });
+      });
+
+      // Register both JIDs to the same folder
+      queue.registerFolder('wa@g.us', 'main');
+      queue.registerFolder('tg@g.us', 'main');
+
+      // Start a task on WhatsApp JID
+      queue.enqueueTask('wa@g.us', 'morning-briefing', taskFn);
+      await vi.advanceTimersByTimeAsync(10);
+      queue.registerProcess('wa@g.us', {} as any, 'container-wa', 'main');
+
+      // Clear writes, then enqueue a message check on Telegram JID
+      const writeFileSync = vi.mocked(fs.default.writeFileSync);
+      writeFileSync.mockClear();
+
+      queue.enqueueMessageCheck('tg@g.us');
+
+      // _close should have been written to preempt the task container
+      const closeWrites = writeFileSync.mock.calls.filter(
+        (call) => typeof call[0] === 'string' && call[0].endsWith('_close'),
+      );
+      expect(closeWrites).toHaveLength(1);
+
+      resolveTask!();
+      await vi.advanceTimersByTimeAsync(10);
+    });
+
+    it('does not spawn second container when sibling has active interactive container', async () => {
+      let resolveWa: () => void;
+
+      const processMessages = vi.fn(async (groupJid: string) => {
+        if (groupJid === 'wa@g.us') {
+          await new Promise<void>((resolve) => {
+            resolveWa = resolve;
+          });
+        }
+        return true;
+      });
+
+      queue.setProcessMessagesFn(processMessages);
+      queue.registerFolder('wa@g.us', 'main');
+      queue.registerFolder('tg@g.us', 'main');
+
+      // Start processing on WhatsApp JID
+      queue.enqueueMessageCheck('wa@g.us');
+      await vi.advanceTimersByTimeAsync(10);
+      queue.registerProcess('wa@g.us', {} as any, 'container-wa', 'main');
+
+      // Enqueue message check on Telegram — should NOT start a new container
+      queue.enqueueMessageCheck('tg@g.us');
+      await vi.advanceTimersByTimeAsync(10);
+
+      // processMessages should have been called only once (for wa)
+      expect(processMessages).toHaveBeenCalledTimes(1);
+
+      resolveWa!();
+      await vi.advanceTimersByTimeAsync(10);
+    });
+
+    it('sendMessage pipes to sibling interactive container', async () => {
+      const fs = await import('fs');
+      let resolveWa: () => void;
+
+      const processMessages = vi.fn(async () => {
+        await new Promise<void>((resolve) => {
+          resolveWa = resolve;
+        });
+        return true;
+      });
+
+      queue.setProcessMessagesFn(processMessages);
+      queue.registerFolder('wa@g.us', 'main');
+      queue.registerFolder('tg@g.us', 'main');
+
+      // Start interactive container on WhatsApp JID
+      queue.enqueueMessageCheck('wa@g.us');
+      await vi.advanceTimersByTimeAsync(10);
+      queue.registerProcess('wa@g.us', {} as any, 'container-wa', 'main');
+
+      // Send message via Telegram JID — should pipe to WhatsApp's container
+      const result = queue.sendMessage('tg@g.us', 'hello from telegram');
+      expect(result).toBe(true);
+
+      // Verify IPC message was written
+      const renameSync = vi.mocked(fs.default.renameSync);
+      expect(renameSync).toHaveBeenCalled();
+
+      resolveWa!();
+      await vi.advanceTimersByTimeAsync(10);
+    });
+
+    it('sendMessage returns false when sibling has task container', async () => {
+      let resolveTask: () => void;
+
+      const taskFn = vi.fn(async () => {
+        await new Promise<void>((resolve) => {
+          resolveTask = resolve;
+        });
+      });
+
+      queue.registerFolder('wa@g.us', 'main');
+      queue.registerFolder('tg@g.us', 'main');
+
+      // Start task on WhatsApp JID
+      queue.enqueueTask('wa@g.us', 'task-1', taskFn);
+      await vi.advanceTimersByTimeAsync(10);
+      queue.registerProcess('wa@g.us', {} as any, 'container-wa', 'main');
+
+      // sendMessage on Telegram should return false (sibling is task container)
+      const result = queue.sendMessage('tg@g.us', 'hello');
+      expect(result).toBe(false);
+
+      resolveTask!();
+      await vi.advanceTimersByTimeAsync(10);
+    });
+
+    it('drains sibling pending messages after container finishes', async () => {
+      const executionOrder: string[] = [];
+      let resolveWa: () => void;
+
+      const processMessages = vi.fn(async (groupJid: string) => {
+        executionOrder.push(groupJid);
+        if (groupJid === 'wa@g.us' && executionOrder.length === 1) {
+          await new Promise<void>((resolve) => {
+            resolveWa = resolve;
+          });
+        }
+        return true;
+      });
+
+      queue.setProcessMessagesFn(processMessages);
+      queue.registerFolder('wa@g.us', 'main');
+      queue.registerFolder('tg@g.us', 'main');
+
+      // Start processing on WhatsApp
+      queue.enqueueMessageCheck('wa@g.us');
+      await vi.advanceTimersByTimeAsync(10);
+
+      // While WhatsApp is active, enqueue Telegram message (sibling)
+      queue.enqueueMessageCheck('tg@g.us');
+      await vi.advanceTimersByTimeAsync(10);
+
+      // Only WhatsApp should have started
+      expect(executionOrder).toEqual(['wa@g.us']);
+
+      // Finish WhatsApp — drain should pick up Telegram
+      resolveWa!();
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(executionOrder).toContain('tg@g.us');
+    });
+
+    it('enqueueTask queues when sibling is active and closes idle sibling', async () => {
+      const fs = await import('fs');
+      let resolveWa: () => void;
+
+      const processMessages = vi.fn(async () => {
+        await new Promise<void>((resolve) => {
+          resolveWa = resolve;
+        });
+        return true;
+      });
+
+      queue.setProcessMessagesFn(processMessages);
+      queue.registerFolder('wa@g.us', 'main');
+      queue.registerFolder('tg@g.us', 'main');
+
+      // Start interactive container on WhatsApp
+      queue.enqueueMessageCheck('wa@g.us');
+      await vi.advanceTimersByTimeAsync(10);
+      queue.registerProcess('wa@g.us', {} as any, 'container-wa', 'main');
+      queue.notifyIdle('wa@g.us');
+
+      const writeFileSync = vi.mocked(fs.default.writeFileSync);
+      writeFileSync.mockClear();
+
+      // Enqueue task on Telegram — sibling is idle, should close it
+      const taskFn = vi.fn(async () => {});
+      queue.enqueueTask('tg@g.us', 'task-1', taskFn);
+
+      const closeWrites = writeFileSync.mock.calls.filter(
+        (call) => typeof call[0] === 'string' && call[0].endsWith('_close'),
+      );
+      expect(closeWrites).toHaveLength(1);
+
+      resolveWa!();
+      await vi.advanceTimersByTimeAsync(10);
+    });
+
+    it('independent folders do not interfere with each other', async () => {
+      const completionCallbacks: Array<() => void> = [];
+
+      const processMessages = vi.fn(async (groupJid: string) => {
+        await new Promise<void>((resolve) => completionCallbacks.push(resolve));
+        return true;
+      });
+
+      queue.setProcessMessagesFn(processMessages);
+      queue.registerFolder('wa@g.us', 'main');
+      queue.registerFolder('tg@g.us', 'other-folder');
+
+      // Start both — they should run concurrently (different folders)
+      queue.enqueueMessageCheck('wa@g.us');
+      queue.enqueueMessageCheck('tg@g.us');
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(processMessages).toHaveBeenCalledTimes(2);
+
+      completionCallbacks.forEach((cb) => cb());
+      await vi.advanceTimersByTimeAsync(10);
+    });
+  });
 });

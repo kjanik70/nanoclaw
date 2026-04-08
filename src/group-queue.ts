@@ -28,6 +28,7 @@ interface GroupState {
 
 export class GroupQueue {
   private groups = new Map<string, GroupState>();
+  private jidToFolder = new Map<string, string>();
   private activeCount = 0;
   private waitingGroups: string[] = [];
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
@@ -57,6 +58,26 @@ export class GroupQueue {
     this.processMessagesFn = fn;
   }
 
+  registerFolder(jid: string, folder: string): void {
+    this.jidToFolder.set(jid, folder);
+  }
+
+  /**
+   * Returns the JID that has an active container for this folder, if any.
+   * Excludes the given JID so callers get a *sibling*, not themselves.
+   */
+  private getActiveSiblingForFolder(excludeJid: string): string | null {
+    const folder = this.jidToFolder.get(excludeJid);
+    if (!folder) return null;
+    for (const [jid, mappedFolder] of this.jidToFolder) {
+      if (mappedFolder === folder && jid !== excludeJid) {
+        const state = this.groups.get(jid);
+        if (state?.active) return jid;
+      }
+    }
+    return null;
+  }
+
   enqueueMessageCheck(groupJid: string): void {
     if (this.shuttingDown) return;
 
@@ -65,6 +86,25 @@ export class GroupQueue {
     if (state.active) {
       state.pendingMessages = true;
       logger.debug({ groupJid }, 'Container active, message queued');
+      return;
+    }
+
+    // Check if a sibling JID has an active container for the same folder
+    const siblingJid = this.getActiveSiblingForFolder(groupJid);
+    if (siblingJid) {
+      const siblingState = this.getGroup(siblingJid);
+      state.pendingMessages = true;
+      if (siblingState.isTaskContainer) {
+        // Preempt the task container — interactive messages take priority
+        this.closeStdin(siblingJid);
+        logger.debug({ groupJid, siblingJid }, 'Preempting sibling task container for interactive message');
+      } else if (siblingState.idleWaiting) {
+        // Close idle interactive container so drain picks up our messages
+        this.closeStdin(siblingJid);
+        logger.debug({ groupJid, siblingJid }, 'Closing idle sibling container to drain pending messages');
+      } else {
+        logger.debug({ groupJid, siblingJid }, 'Sibling container active, message queued');
+      }
       return;
     }
 
@@ -102,6 +142,18 @@ export class GroupQueue {
         this.closeStdin(groupJid);
       }
       logger.debug({ groupJid, taskId }, 'Container active, task queued');
+      return;
+    }
+
+    // Check if a sibling JID has an active container for the same folder
+    const siblingJid = this.getActiveSiblingForFolder(groupJid);
+    if (siblingJid) {
+      const siblingState = this.getGroup(siblingJid);
+      state.pendingTasks.push({ id: taskId, groupJid, fn });
+      if (siblingState.idleWaiting) {
+        this.closeStdin(siblingJid);
+      }
+      logger.debug({ groupJid, taskId, siblingJid }, 'Sibling container active, task queued');
       return;
     }
 
@@ -145,13 +197,30 @@ export class GroupQueue {
   /**
    * Send a follow-up message to the active container via IPC file.
    * Returns true if the message was written, false if no active container.
+   * Checks sibling JIDs sharing the same folder if this JID has no active container.
    */
   sendMessage(groupJid: string, text: string): boolean {
     const state = this.getGroup(groupJid);
-    if (!state.active || !state.groupFolder || state.isTaskContainer) return false;
-    state.idleWaiting = false; // Agent is about to receive work, no longer idle
+    if (state.active && state.groupFolder && !state.isTaskContainer) {
+      state.idleWaiting = false;
+      return this.writeIpcMessage(state.groupFolder, text);
+    }
 
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+    // Check sibling JID with same folder
+    const siblingJid = this.getActiveSiblingForFolder(groupJid);
+    if (siblingJid) {
+      const siblingState = this.getGroup(siblingJid);
+      if (!siblingState.isTaskContainer && siblingState.groupFolder) {
+        siblingState.idleWaiting = false;
+        return this.writeIpcMessage(siblingState.groupFolder, text);
+      }
+    }
+
+    return false;
+  }
+
+  private writeIpcMessage(groupFolder: string, text: string): boolean {
+    const inputDir = path.join(DATA_DIR, 'ipc', groupFolder, 'input');
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
@@ -291,7 +360,30 @@ export class GroupQueue {
       return;
     }
 
-    // Nothing pending for this group; check if other groups are waiting for a slot
+    // Check sibling JIDs (same folder) for pending work
+    const folder = this.jidToFolder.get(groupJid);
+    if (folder) {
+      for (const [sibJid, sibFolder] of this.jidToFolder) {
+        if (sibFolder === folder && sibJid !== groupJid) {
+          const sibState = this.getGroup(sibJid);
+          if (sibState.pendingTasks.length > 0) {
+            const task = sibState.pendingTasks.shift()!;
+            this.runTask(sibJid, task).catch((err) =>
+              logger.error({ groupJid: sibJid, taskId: task.id, err }, 'Unhandled error in runTask (sibling drain)'),
+            );
+            return;
+          }
+          if (sibState.pendingMessages) {
+            this.runForGroup(sibJid, 'drain').catch((err) =>
+              logger.error({ groupJid: sibJid, err }, 'Unhandled error in runForGroup (sibling drain)'),
+            );
+            return;
+          }
+        }
+      }
+    }
+
+    // Nothing pending for this group or siblings; check if other groups are waiting for a slot
     this.drainWaiting();
   }
 
