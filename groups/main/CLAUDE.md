@@ -238,3 +238,17 @@ When scheduling tasks for other groups, use the `target_group_jid` parameter wit
 - `schedule_task(prompt: "...", schedule_type: "cron", schedule_value: "0 9 * * 1", target_group_jid: "120363336345536173@g.us")`
 
 The task will run in that group's context with access to their files and memory.
+
+---
+
+## Managing Scheduled Tasks
+
+You can view active tasks in `/workspace/ipc/current_tasks.json`. Each entry has an `id`, `status`, and `prompt`.
+
+When the user says a pipeline is done, monitoring is no longer needed, or asks you to stop/cancel recurring updates:
+1. Read `current_tasks.json` to find the relevant task IDs
+2. Call `pause_task` or `cancel_task` for each one — do not just acknowledge the request
+
+Use `pause_task` when the user might want to resume later. Use `cancel_task` when the task is permanently done.
+
+**Important:** Simply acknowledging "ok, I'll stop" is not enough — you must actually call the tool for each task ID. If there are multiple monitoring tasks for the same pipeline, pause/cancel all of them.
