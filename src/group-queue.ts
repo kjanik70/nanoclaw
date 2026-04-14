@@ -85,7 +85,13 @@ export class GroupQueue {
 
     if (state.active) {
       state.pendingMessages = true;
-      logger.debug({ groupJid }, 'Container active, message queued');
+      if (state.isTaskContainer) {
+        // Preempt the task container — interactive messages take priority
+        this.closeStdin(groupJid);
+        logger.info({ groupJid }, 'Preempting task container for interactive message');
+      } else {
+        logger.debug({ groupJid }, 'Container active, message queued');
+      }
       return;
     }
 
