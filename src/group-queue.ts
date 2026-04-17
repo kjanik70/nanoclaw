@@ -349,7 +349,32 @@ export class GroupQueue {
 
     const state = this.getGroup(groupJid);
 
-    // Tasks first (they won't be re-discovered from SQLite like messages)
+    // Messages first — interactive messages preempted a task to get here,
+    // so they must run before the next queued task.
+    if (state.pendingMessages) {
+      this.runForGroup(groupJid, 'drain').catch((err) =>
+        logger.error({ groupJid, err }, 'Unhandled error in runForGroup (drain)'),
+      );
+      return;
+    }
+
+    // Check sibling JIDs (same folder) for pending messages first
+    const folder = this.jidToFolder.get(groupJid);
+    if (folder) {
+      for (const [sibJid, sibFolder] of this.jidToFolder) {
+        if (sibFolder === folder && sibJid !== groupJid) {
+          const sibState = this.getGroup(sibJid);
+          if (sibState.pendingMessages) {
+            this.runForGroup(sibJid, 'drain').catch((err) =>
+              logger.error({ groupJid: sibJid, err }, 'Unhandled error in runForGroup (sibling drain)'),
+            );
+            return;
+          }
+        }
+      }
+    }
+
+    // Then tasks (they won't be re-discovered from SQLite like messages)
     if (state.pendingTasks.length > 0) {
       const task = state.pendingTasks.shift()!;
       this.runTask(groupJid, task).catch((err) =>
@@ -358,16 +383,7 @@ export class GroupQueue {
       return;
     }
 
-    // Then pending messages
-    if (state.pendingMessages) {
-      this.runForGroup(groupJid, 'drain').catch((err) =>
-        logger.error({ groupJid, err }, 'Unhandled error in runForGroup (drain)'),
-      );
-      return;
-    }
-
-    // Check sibling JIDs (same folder) for pending work
-    const folder = this.jidToFolder.get(groupJid);
+    // Check sibling JIDs for pending tasks
     if (folder) {
       for (const [sibJid, sibFolder] of this.jidToFolder) {
         if (sibFolder === folder && sibJid !== groupJid) {
@@ -376,12 +392,6 @@ export class GroupQueue {
             const task = sibState.pendingTasks.shift()!;
             this.runTask(sibJid, task).catch((err) =>
               logger.error({ groupJid: sibJid, taskId: task.id, err }, 'Unhandled error in runTask (sibling drain)'),
-            );
-            return;
-          }
-          if (sibState.pendingMessages) {
-            this.runForGroup(sibJid, 'drain').catch((err) =>
-              logger.error({ groupJid: sibJid, err }, 'Unhandled error in runForGroup (sibling drain)'),
             );
             return;
           }
